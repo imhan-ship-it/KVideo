@@ -2,13 +2,14 @@ name: Upstream Sync
 
 permissions:
   contents: write
-  pull-requests: write # Required to create the PR
+  pull-requests: write
+  actions: write
 
 env:
   UPSTREAM_REPO: KuekHaoYang/KVideo
   UPSTREAM_BRANCH: main
   TARGET_BRANCH: main
-  SYNC_BRANCH: upstream-sync-conflict # The branch name used if a conflict occurs
+  SYNC_BRANCH: upstream-sync-conflict
 
 on:
   schedule:
@@ -27,47 +28,102 @@ jobs:
 
     steps:
       - name: Checkout target repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # Required to access full history for merging
+          fetch-depth: 0
 
-      - name: Sync and Merge (with PR Fallback)
+      - name: Sync upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
-          # 1. Configure Git
+          # Configure Git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 2. Add Upstream Remote
+          # Add upstream repository
           git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
           git fetch upstream
 
-          # 3. Attempt Merge
-          echo "Attempting to merge upstream/$UPSTREAM_BRANCH into $TARGET_BRANCH..."
-          
-          if git merge upstream/$UPSTREAM_BRANCH; then
-            echo "✅ Merge successful. Pushing changes..."
-            git push origin $TARGET_BRANCH
+          echo "Syncing upstream/$UPSTREAM_BRANCH into $TARGET_BRANCH..."
+
+          # Use squash merge so upstream workflow commits
+          # do not become part of this repository's branch history.
+          if git merge --squash upstream/$UPSTREAM_BRANCH; then
+
+            echo "Upstream changes applied."
+
+            # Keep this repository's own GitHub Actions workflows.
+            # Upstream is not allowed to overwrite them.
+            git restore \
+              --source=HEAD \
+              --staged \
+              --worktree \
+              .github/workflows
+
+            # Check whether there are actual code changes to sync.
+            if git diff --cached --quiet; then
+              echo "Already up to date. No code changes to push."
+              git reset --hard HEAD
+              exit 0
+            fi
+
+            git commit -m "chore: sync latest changes from upstream"
+
+            echo "Pushing synced changes..."
+            git push origin "$TARGET_BRANCH"
+
+            echo "Sync completed successfully."
+
           else
-            echo "⚠️ Merge conflict detected. Aborting merge and creating PR..."
-            git merge --abort
 
-            # 4. Create a clean branch from upstream content
-            git checkout -B $SYNC_BRANCH upstream/$UPSTREAM_BRANCH
-            git push -f origin $SYNC_BRANCH
+            echo "Merge conflict detected."
 
-            # 5. Create Pull Request using GitHub CLI
-            # The '|| true' prevents failure if the PR already exists
-            gh pr create \
-              --title "🚨 Manual Sync Required: Conflicts with Upstream" \
-              --body "The automatic sync failed due to merge conflicts. This PR contains the latest upstream changes. Please resolve conflicts and merge manually." \
-              --head $SYNC_BRANCH \
-              --base $TARGET_BRANCH \
-              || echo "PR already exists or could not be created."
+            # Clean failed squash merge
+            git reset --hard HEAD
+
+            # Create/update conflict review branch
+            git checkout -B "$SYNC_BRANCH" "origin/$TARGET_BRANCH"
+
+            echo "Trying upstream-preferred conflict resolution..."
+
+            # Try again and prefer upstream version when normal
+            # content conflicts occur.
+            if git merge --squash -X theirs upstream/$UPSTREAM_BRANCH; then
+
+              # Still keep our own workflows
+              git restore \
+                --source=HEAD \
+                --staged \
+                --worktree \
+                .github/workflows
+
+              if git diff --cached --quiet; then
+                echo "No syncable changes after excluding workflows."
+                exit 0
+              fi
+
+              git commit -m "chore: upstream sync requires review"
+
+              git push -f origin "$SYNC_BRANCH"
+
+              gh pr create \
+                --title "Manual Review Required: Upstream Sync" \
+                --body "Automatic upstream sync encountered conflicts. This PR contains the latest upstream changes with this repository's own GitHub Actions workflows preserved. Please review before merging." \
+                --head "$SYNC_BRANCH" \
+                --base "$TARGET_BRANCH" \
+                || echo "PR already exists or could not be created."
+
+            else
+
+              echo "Automatic conflict resolution failed."
+              git reset --hard HEAD
+              exit 1
+
+            fi
           fi
 
-      - name: Delete workflow runs
+      - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
